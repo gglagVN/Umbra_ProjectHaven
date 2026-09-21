@@ -1,0 +1,866 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using DG.Tweening;
+using TMPro;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+[System.Serializable]
+public class GameSaveData
+{
+    public int saveVersion;
+    public Vector3 playerPosition;
+    public float playerYaw;
+    public float cameraPitch;
+    public float playerHealth;
+    public int currentWeapon;
+    public bool[] gunUnlocked;
+    public int[] gunBulletsLeft;
+    public int[] gunAmmoReserve;
+    public string[] collectedDocuments;
+    public string[] openedObjectIds;
+    public string[] playedDialogueIds;
+    public string[] deadEnemyIds;
+    public string[] collectedAmmoBoxIds;
+    public bool leverUsed;
+    public float countdownRemaining;
+    public TextMeshProUGUI countDownTimeText;
+
+}
+
+public static class SaveSystem
+{
+    private const string SaveFileName = "save.json";
+
+    private static string FilePath => Path.Combine(Application.persistentDataPath, SaveFileName);
+
+    /// <summary>
+    /// Trả về true khi có file save đọc được và parse thành công.
+    /// </summary>
+    public static bool HasSave()
+    {
+        return Load() != null;
+    }
+
+    /// <summary>
+    /// Đọc save từ đĩa, trả về null nếu không có file hoặc file hỏng.
+    /// </summary>
+    public static GameSaveData Load()
+    {
+        try
+        {
+            if (!File.Exists(FilePath))
+            {
+                return null;
+            }
+
+            string json = File.ReadAllText(FilePath);
+            if (string.IsNullOrWhiteSpace(json))
+            {
+                return null;
+            }
+
+            return JsonUtility.FromJson<GameSaveData>(json);
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning($"SaveSystem: không đọc được save ({e.Message}), coi như chưa có save.");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Ghi save xuống đĩa dưới dạng JSON.
+    /// </summary>
+    public static void Save(GameSaveData data)
+    {
+        if (data == null)
+        {
+            return;
+        }
+
+        try
+        {
+            File.WriteAllText(FilePath, JsonUtility.ToJson(data, true));
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"SaveSystem: ghi save thất bại ({e.Message}).");
+        }
+    }
+
+    /// <summary>
+    /// Xoá file save hiện có.
+    /// </summary>
+    public static void Delete()
+    {
+        try
+        {
+            if (File.Exists(FilePath))
+            {
+                File.Delete(FilePath);
+            }
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning($"SaveSystem: xoá save thất bại ({e.Message}).");
+        }
+    }
+}
+
+public class GameManager : MonoBehaviour
+{
+    public static GameManager Instance;
+
+    private const int CurrentSaveVersion = 1;
+
+    [Header("Pause Menu")]
+    public GameObject pausePanel;
+    [SerializeField] private SetOnOffPanel settingsPanel;
+
+    [Header("Save Feedback")]
+    [SerializeField] private TMP_Text saveFeedbackText;
+    [SerializeField] private float saveFeedbackDuration = 1.5f;
+
+    [Header("Save References")]
+    [SerializeField] private Transform playerTransform;
+    [SerializeField] private PlayerHealth playerHealth;
+    [SerializeField] private PlayerLook playerLook;
+    [SerializeField] private GunHolder gunHolder;
+    [SerializeField] private DocumentManager documentManager;
+    [SerializeField] private CountdownTimer countdownTimer;
+    [SerializeField] private MonoBehaviour playerMovement;
+    [SerializeField] private InputManager inputManager;
+
+    private CharacterController playerController;
+    private GameSaveData pendingSaveData;
+    private bool isPaused = false;
+    private bool isReloadingScene = false;
+    private bool stateRestored = false;
+
+    private void Awake()
+    {
+        // Singleton
+        if (Instance == null)
+        {
+            Instance = this;
+        }
+        else
+        {
+            Destroy(gameObject);
+            return;
+        }
+
+        // Đảm bảo game bắt đầu ở trạng thái bình thường
+        Time.timeScale = 1f;
+
+        ValidateSaveReferences();
+
+        if (playerTransform != null)
+        {
+            playerController = playerTransform.GetComponent<CharacterController>();
+        }
+
+        // Phải chặn thoại ngay trong Awake vì player có thể đứng sẵn trong vùng trigger lúc scene mở
+        pendingSaveData = SaveSystem.Load();
+        if (pendingSaveData != null)
+        {
+            RestoreDialogueTriggers(pendingSaveData);
+        }
+    }
+
+    private IEnumerator Start()
+    {
+        pausePanel.SetActive(false);
+
+        Cursor.lockState = CursorLockMode.Locked;
+        Cursor.visible = false;
+
+        // Chờ 1 frame cho Awake/Start của các script khác chạy xong rồi mới ghi đè state
+        yield return null;
+
+        if (pendingSaveData != null)
+        {
+            ApplyState(pendingSaveData);
+            pendingSaveData = null;
+        }
+
+        stateRestored = true;
+    }
+
+    private void Update()
+    {
+        if (Input.GetKeyDown(KeyCode.Escape))
+        {
+            TogglePause();
+        }
+    }
+
+    public void TogglePause()
+    {
+        if (isPaused)
+        {
+            ResumeGame();
+        }
+        else
+        {
+            PauseGame();
+        }
+    }
+
+    public void PauseGame()
+    {
+        isPaused = true;
+
+        // Hiện Pause Panel
+        pausePanel.SetActive(true);
+
+        // Dừng game
+        Time.timeScale = 0f;
+
+        // Hiện chuột
+        Cursor.lockState = CursorLockMode.None;
+        Cursor.visible = true;
+    }
+
+    public void ResumeGame()
+    {
+        isPaused = false;
+        settingsPanel.ForceClose();
+
+        // Tắt Pause Panel
+        pausePanel.SetActive(false);
+
+        // Tiếp tục game
+        Time.timeScale = 1f;
+
+        // Khóa chuột lại
+        Cursor.lockState = CursorLockMode.Locked;
+        Cursor.visible = false;
+    }
+
+    public bool IsPaused()
+    {
+        return isPaused;
+    }
+
+    public void LoadScene(string name)
+    {
+        Time.timeScale = 1f;
+        SaveNow();
+        SceneManager.LoadScene(name);
+    }
+
+    /// <summary>
+    /// Ghi state hiện tại xuống file save, bỏ qua khi game đang dừng hoặc player đang bị khoá điều khiển.
+    /// </summary>
+    public void SaveNow()
+    {
+        WriteSave(false);
+    }
+
+    /// <summary>
+    /// Ghi save theo yêu cầu từ menu Pause, bỏ qua điều kiện game đang dừng và báo kết quả lên UI.
+    /// </summary>
+    public void SaveFromMenu()
+    {
+        bool saved = WriteSave(true);
+        ShowSaveFeedback(saved);
+    }
+
+    private bool WriteSave(bool ignorePause)
+    {
+        if (isReloadingScene || !stateRestored)
+        {
+            return false;
+        }
+
+        if (!CanSave(ignorePause))
+        {
+            return false;
+        }
+
+        GameSaveData data = CaptureState();
+        if (data == null)
+        {
+            return false;
+        }
+
+        SaveSystem.Save(data);
+        return SaveSystem.HasSave();
+    }
+
+    /// <summary>
+    /// Hiện dòng thông báo kết quả lưu rồi tự mờ dần, chạy được cả khi game đang tạm dừng.
+    /// </summary>
+    private void ShowSaveFeedback(bool saved)
+    {
+        if (saveFeedbackText == null)
+        {
+            Debug.LogWarning("GameManager: chưa gán saveFeedbackText nên không hiện được thông báo lưu.", this);
+            return;
+        }
+
+        saveFeedbackText.text = saved ? "GAME SAVED" : "SAVE FAILED";
+        saveFeedbackText.color = saved ? new Color(0.55f, 1f, 0.6f) : new Color(1f, 0.45f, 0.45f);
+
+        saveFeedbackText.gameObject.SetActive(true);
+        saveFeedbackText.DOKill();
+        saveFeedbackText.alpha = 1f;
+        saveFeedbackText.DOFade(0f, 0.4f)
+            .SetDelay(saveFeedbackDuration)
+            .SetUpdate(true)
+            .SetLink(saveFeedbackText.gameObject)
+            .OnComplete(() => saveFeedbackText.gameObject.SetActive(false));
+    }
+
+    /// <summary>
+    /// Nạp lại scene hiện tại để save gần nhất được áp dụng lại từ đầu.
+    /// </summary>
+    public void LoadSavedGame()
+    {
+        if (!SaveSystem.HasSave())
+        {
+            RestartGame();
+        }
+
+        isReloadingScene = true;
+        Time.timeScale = 1f;
+        SceneManager.LoadScene(SceneManager.GetActiveScene().name);
+    }
+
+    /// <summary>
+    /// Chơi lại từ đầu: xoá save rồi nạp lại scene.
+    /// </summary>
+    public void RestartGame()
+    {
+        isReloadingScene = true;
+        Time.timeScale = 1f;
+        SaveSystem.Delete();
+        SceneManager.LoadScene(SceneManager.GetActiveScene().name);
+    }
+
+    /// <summary>
+    /// Lưu lại rồi thoát game.
+    /// </summary>
+    public void QuitGame()
+    {
+        SaveFromMenu();
+        Application.Quit();
+    }
+
+    /// <summary>
+    /// Lưu lại rồi chuyển sang scene khác, dùng cho nút quay về menu chính.
+    /// </summary>
+    public void SaveAndLoadScene(string sceneName)
+    {
+        SaveFromMenu();
+        isReloadingScene = true;
+        Time.timeScale = 1f;
+        SceneManager.LoadScene(sceneName);
+    }
+
+    /// <summary>
+    /// Kết thúc game thắng: xoá save và chuyển sang màn EndGame.
+    /// </summary>
+    public void CompleteGame()
+    {
+        int collectedDocument = documentManager.documents.Count;
+        if (collectedDocument < 10)
+        {
+            PlayerPrefs.SetInt("EndingType", 2);
+        }
+        else
+        {
+            PlayerPrefs.SetInt("EndingType", 3);
+        }
+        isReloadingScene = true;
+        Time.timeScale = 1f;
+        SaveSystem.Delete();
+        SceneManager.LoadScene("EndGame");
+
+    }
+
+    /// <summary>
+    /// Player chết: nạp lại scene hiện tại để save gần nhất tự áp dụng ở Start.
+    /// </summary>
+    public void OnPlayerDied()
+    {
+        if (isReloadingScene)
+        {
+            return;
+        }
+
+        isReloadingScene = true;
+        Time.timeScale = 1f;
+        SceneManager.LoadScene(SceneManager.GetActiveScene().name);
+    }
+
+    private void OnApplicationQuit()
+    {
+        SaveNow();
+    }
+
+    private void OnApplicationPause(bool pauseStatus)
+    {
+        if (pauseStatus)
+        {
+            SaveNow();
+        }
+    }
+
+    private bool CanSave(bool ignorePause)
+    {
+        if (!ignorePause && Time.timeScale == 0f)
+        {
+            return false;
+        }
+
+        if (HackManager.Instance != null && HackManager.Instance.IsActive)
+        {
+            return false;
+        }
+
+        if (playerMovement != null && !playerMovement.enabled)
+        {
+            return false;
+        }
+
+        if (inputManager != null && !inputManager.enabled)
+        {
+            return false;
+        }
+
+        if (playerLook != null && !playerLook.enabled)
+        {
+            return false;
+        }
+
+        return playerTransform != null
+            && playerHealth != null
+            && playerLook != null
+            && gunHolder != null
+            && documentManager != null;
+    }
+
+    /// <summary>
+    /// Gom toàn bộ state cần lưu của scene gameplay thành một GameSaveData.
+    /// </summary>
+    private GameSaveData CaptureState()
+    {
+        GameSaveData data = new GameSaveData
+        {
+            saveVersion = CurrentSaveVersion,
+            playerPosition = playerTransform.position,
+            playerYaw = playerTransform.eulerAngles.y,
+            cameraPitch = playerLook.CameraPitch,
+            playerHealth = playerHealth.CurrentHealth,
+            currentWeapon = gunHolder.currentWeapon,
+            countdownRemaining = -1f
+        };
+
+        GameObject[] weapons = gunHolder.weapons;
+        int weaponCount = weapons != null ? weapons.Length : 0;
+
+        data.gunUnlocked = new bool[weaponCount];
+        data.gunBulletsLeft = new int[weaponCount];
+        data.gunAmmoReserve = new int[weaponCount];
+
+        for (int i = 0; i < weaponCount; i++)
+        {
+            Gun gun = weapons[i] != null ? weapons[i].GetComponent<Gun>() : null;
+            if (gun == null)
+            {
+                continue;
+            }
+
+            data.gunUnlocked[i] = gun.isPlayable;
+            data.gunBulletsLeft[i] = gun.bulletsLeft;
+            data.gunAmmoReserve[i] = gun.amountOfBullet;
+        }
+
+        List<DocumentData> documents = documentManager.documents;
+        List<string> documentTitles = new List<string>();
+        if (documents != null)
+        {
+            for (int i = 0; i < documents.Count; i++)
+            {
+                if (documents[i] != null)
+                {
+                    documentTitles.Add(documents[i].title);
+                }
+            }
+        }
+        data.collectedDocuments = documentTitles.ToArray();
+
+        List<string> openedIds = new List<string>();
+        Interactable[] interactables = FindObjectsOfType<Interactable>(true);
+
+        for (int i = 0; i < interactables.Length; i++)
+        {
+            Interactable interactable = interactables[i];
+
+            if (interactable is Crate crate)
+            {
+                if (crate.IsSolved)
+                {
+                    openedIds.Add(crate.SaveId);
+                }
+            }
+            else if (interactable is Locket locket)
+            {
+                if (locket.IsOpen)
+                {
+                    openedIds.Add(locket.SaveId);
+                }
+            }
+            else if (interactable is Lever lever)
+            {
+                if (lever.IsUsed)
+                {
+                    data.leverUsed = true;
+                    openedIds.Add(lever.SaveId);
+                }
+            }
+            else if (interactable is KeypadInteract keypad)
+            {
+                if (keypad.IsSolved)
+                {
+                    openedIds.Add(keypad.SaveId);
+                }
+            }
+        }
+        data.openedObjectIds = openedIds.ToArray();
+
+        List<string> playedDialogues = new List<string>();
+        DialogueTrigger[] dialogueTriggers = FindObjectsOfType<DialogueTrigger>(true);
+
+        for (int i = 0; i < dialogueTriggers.Length; i++)
+        {
+            DialogueTrigger trigger = dialogueTriggers[i];
+
+            if (trigger.Played && !string.IsNullOrEmpty(trigger.SaveId))
+            {
+                playedDialogues.Add(trigger.SaveId);
+            }
+        }
+        data.playedDialogueIds = playedDialogues.ToArray();
+
+        if (countdownTimer != null && countdownTimer.IsRunning)
+        {
+            data.countdownRemaining = countdownTimer.Remaining;
+        }
+
+        EnemySaveData[] enemies = FindObjectsOfType<EnemySaveData>(true);
+        List<string> deadEnemyIds = new List<string>();
+        for (int i = 0; i < enemies.Length; i++)
+        {
+            EnemySaveData enemySaveData = enemies[i];
+            Enemy enemy = enemySaveData.GetComponent<Enemy>();
+            if (enemy != null && enemy.IsDead && !string.IsNullOrEmpty(enemySaveData.SaveId))
+            {
+                deadEnemyIds.Add(enemySaveData.SaveId);
+            }
+        }
+        data.deadEnemyIds = deadEnemyIds.ToArray();
+
+        AmmoBoxSaveData[] ammoBoxes = FindObjectsOfType<AmmoBoxSaveData>(true);
+        List<string> collectedAmmoBoxIds = new List<string>();
+        for (int i = 0; i < ammoBoxes.Length; i++)
+        {
+            AmmoBoxSaveData ammoBox = ammoBoxes[i];
+            if (ammoBox.collected && !string.IsNullOrEmpty(ammoBox.SaveId))
+            {
+                collectedAmmoBoxIds.Add(ammoBox.SaveId);
+            }
+        }
+        data.collectedAmmoBoxIds = collectedAmmoBoxIds.ToArray();
+
+        return data;
+    }
+
+    /// <summary>
+    /// Khôi phục scene gameplay về đúng state đã lưu.
+    /// </summary>
+    private void ApplyState(GameSaveData data)
+    {
+        if (playerTransform == null || playerHealth == null || playerLook == null || gunHolder == null)
+        {
+            Debug.LogError("GameManager: thiếu reference nên không thể áp dụng save.", this);
+            return;
+        }
+
+        RestorePlayer(data);
+        RestoreWeapons(data);
+        RestoreInteractables(data);
+        RestoreEnemies(data);
+        RestoreAmmoBoxes(data);
+    }
+
+    private void RestorePlayer(GameSaveData data)
+    {
+        if (playerController != null)
+        {
+            playerController.enabled = false;
+        }
+
+        playerTransform.position = data.playerPosition;
+        playerTransform.rotation = Quaternion.Euler(0f, data.playerYaw, 0f);
+
+        if (playerController != null)
+        {
+            playerController.enabled = true;
+        }
+
+        playerLook.CameraPitch = data.cameraPitch;
+        playerHealth.SetHealth(data.playerHealth);
+    }
+
+    private void RestoreWeapons(GameSaveData data)
+    {
+        GameObject[] weapons = gunHolder.weapons;
+        if (weapons == null)
+        {
+            return;
+        }
+
+        for (int i = 0; i < weapons.Length; i++)
+        {
+            if (weapons[i] == null)
+            {
+                continue;
+            }
+
+            Gun gun = weapons[i].GetComponent<Gun>();
+            if (gun == null)
+            {
+                continue;
+            }
+
+            if (data.gunUnlocked != null && i < data.gunUnlocked.Length)
+            {
+                gun.isPlayable = data.gunUnlocked[i];
+            }
+
+            if (data.gunBulletsLeft != null && i < data.gunBulletsLeft.Length)
+            {
+                gun.bulletsLeft = data.gunBulletsLeft[i];
+            }
+
+            if (data.gunAmmoReserve != null && i < data.gunAmmoReserve.Length)
+            {
+                gun.amountOfBullet = data.gunAmmoReserve[i];
+            }
+        }
+
+        if (data.currentWeapon >= 0 && data.currentWeapon < weapons.Length)
+        {
+            gunHolder.SelectWeapon(data.currentWeapon);
+        }
+    }
+
+    private void RestoreInteractables(GameSaveData data)
+    {
+        HashSet<string> openedIds = new HashSet<string>();
+        if (data.openedObjectIds != null)
+        {
+            for (int i = 0; i < data.openedObjectIds.Length; i++)
+            {
+                openedIds.Add(data.openedObjectIds[i]);
+            }
+        }
+
+        HashSet<string> collectedDocuments = new HashSet<string>();
+        if (data.collectedDocuments != null)
+        {
+            for (int i = 0; i < data.collectedDocuments.Length; i++)
+            {
+                collectedDocuments.Add(data.collectedDocuments[i]);
+            }
+        }
+
+        Interactable[] interactables = FindObjectsOfType<Interactable>(true);
+
+        for (int i = 0; i < interactables.Length; i++)
+        {
+            Interactable interactable = interactables[i];
+
+            if (interactable is Crate crate)
+            {
+                if (openedIds.Contains(crate.SaveId))
+                {
+                    crate.ForceSolved();
+                }
+            }
+            else if (interactable is Locket locket)
+            {
+                if (openedIds.Contains(locket.SaveId))
+                {
+                    locket.ForceOpen();
+                }
+            }
+            else if (interactable is Lever lever)
+            {
+                if (data.leverUsed || openedIds.Contains(lever.SaveId))
+                {
+                    lever.ForceUsed();
+                }
+            }
+            else if (interactable is KeypadInteract keypad)
+            {
+                if (openedIds.Contains(keypad.SaveId))
+                {
+                    keypad.ForceSolved();
+                }
+            }
+            else if (interactable is DocumentInterac documentPickup)
+            {
+                if (documentPickup.document != null &&
+                    collectedDocuments.Contains(documentPickup.document.title))
+                {
+                    if (documentManager != null)
+                    {
+                        documentManager.AddDocument(documentPickup.document);
+                    }
+                    Destroy(documentPickup.gameObject);
+                }
+            }
+            else if (interactable is GunInteract gunPickup)
+            {
+                if (gunPickup.gunToUnlock != null && gunPickup.gunToUnlock.isPlayable)
+                {
+                    Destroy(gunPickup.gameObject);
+                }
+            }
+        }
+
+        if (countdownTimer != null && data.countdownRemaining > 0f)
+        {
+            countdownTimer.ResumeCountdown(data.countdownRemaining);
+        }
+    }
+
+    private void RestoreEnemies(GameSaveData data)
+    {
+        HashSet<string> deadEnemyIds = new HashSet<string>();
+        if (data.deadEnemyIds != null)
+        {
+            for (int i = 0; i < data.deadEnemyIds.Length; i++)
+            {
+                if (!string.IsNullOrEmpty(data.deadEnemyIds[i]))
+                {
+                    deadEnemyIds.Add(data.deadEnemyIds[i]);
+                }
+            }
+        }
+
+        EnemySaveData[] enemies = FindObjectsOfType<EnemySaveData>(true);
+        for (int i = 0; i < enemies.Length; i++)
+        {
+            EnemySaveData enemySaveData = enemies[i];
+            if (deadEnemyIds.Contains(enemySaveData.SaveId))
+            {
+                enemySaveData.RestoreDeadState();
+            }
+        }
+    }
+
+    private void RestoreAmmoBoxes(GameSaveData data)
+    {
+        HashSet<string> collectedAmmoBoxIds = new HashSet<string>();
+        if (data.collectedAmmoBoxIds != null)
+        {
+            for (int i = 0; i < data.collectedAmmoBoxIds.Length; i++)
+            {
+                if (!string.IsNullOrEmpty(data.collectedAmmoBoxIds[i]))
+                {
+                    collectedAmmoBoxIds.Add(data.collectedAmmoBoxIds[i]);
+                }
+            }
+        }
+
+        AmmoBoxSaveData[] ammoBoxes = FindObjectsOfType<AmmoBoxSaveData>(true);
+        for (int i = 0; i < ammoBoxes.Length; i++)
+        {
+            AmmoBoxSaveData ammoBox = ammoBoxes[i];
+            if (collectedAmmoBoxIds.Contains(ammoBox.SaveId))
+            {
+                ammoBox.collected = true;
+                ammoBox.gameObject.SetActive(false);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Đánh dấu lại các đoạn thoại đã nghe để chúng không phát lại sau khi nạp save.
+    /// </summary>
+    private void RestoreDialogueTriggers(GameSaveData data)
+    {
+        HashSet<string> playedIds = new HashSet<string>();
+        if (data.playedDialogueIds != null)
+        {
+            for (int i = 0; i < data.playedDialogueIds.Length; i++)
+            {
+                playedIds.Add(data.playedDialogueIds[i]);
+            }
+        }
+
+        DialogueTrigger[] triggers = FindObjectsOfType<DialogueTrigger>(true);
+
+        for (int i = 0; i < triggers.Length; i++)
+        {
+            DialogueTrigger trigger = triggers[i];
+
+            if (playedIds.Contains(trigger.SaveId))
+            {
+                trigger.ForcePlayed();
+            }
+        }
+    }
+
+
+    private void ValidateSaveReferences()
+    {
+        if (playerTransform == null)
+        {
+            Debug.LogError("GameManager: chưa gán playerTransform trong Inspector.", this);
+        }
+
+        if (playerHealth == null)
+        {
+            Debug.LogError("GameManager: chưa gán playerHealth trong Inspector.", this);
+        }
+
+        if (playerLook == null)
+        {
+            Debug.LogError("GameManager: chưa gán playerLook trong Inspector.", this);
+        }
+
+        if (gunHolder == null)
+        {
+            Debug.LogError("GameManager: chưa gán gunHolder trong Inspector.", this);
+        }
+
+        if (documentManager == null)
+        {
+            Debug.LogError("GameManager: chưa gán documentManager trong Inspector.", this);
+        }
+
+        if (countdownTimer == null)
+        {
+            Debug.LogError("GameManager: chưa gán countdownTimer trong Inspector.", this);
+        }
+
+        if (playerMovement == null)
+        {
+            Debug.LogError("GameManager: chưa gán playerMovement trong Inspector.", this);
+        }
+
+        if (inputManager == null)
+        {
+            Debug.LogError("GameManager: chưa gán inputManager trong Inspector.", this);
+        }
+    }
+}

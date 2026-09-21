@@ -1,0 +1,56 @@
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+
+public class PatrolState : BaseState
+{
+    public int waypointIndex;
+    public float waitTimer;
+
+    public override void Enter()
+    {
+        waypointIndex = 0;
+        waitTimer = 0f;
+
+        enemy.Agent.stoppingDistance = 0f;
+        enemy.Agent.SetDestination(enemy.path.waypoints[waypointIndex].position);
+    }
+    public override void Exit()
+    {
+
+    }
+    public override void Perform()
+    {
+        PatrolCycle();
+        if (enemy.PlayerVisible)
+        {
+            stateMachine.ChangeState(stateMachine.AttackStateInstance);
+        }
+    }
+    public void PatrolCycle()
+    {
+        if (enemy == null ||
+            enemy.IsDead ||
+            enemy.Agent == null ||
+            !enemy.Agent.enabled ||
+            !enemy.Agent.isOnNavMesh)
+        {
+            return;
+        }
+
+        if (enemy.Agent.remainingDistance < 0.2f)
+        {
+            waitTimer += Time.deltaTime;
+            if (waitTimer > 3f)
+            {
+                if (waypointIndex < enemy.path.waypoints.Count - 1)
+                    waypointIndex++;
+                else
+                    waypointIndex = 0;
+                waitTimer = 0f;
+            }
+
+            enemy.Agent.SetDestination(enemy.path.waypoints[waypointIndex].position);
+        }
+    }
+}
